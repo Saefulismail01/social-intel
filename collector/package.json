@@ -1,0 +1,13 @@
+{
+  "name": "square-passive-collector",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "search": "node src/search.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright-core": "^1.54.2"
+  }
+}

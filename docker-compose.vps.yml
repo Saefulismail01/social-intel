@@ -1,0 +1,32 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      SI_DATABASE_URL: sqlite:////data/social-intelligence.db
+      SI_CORS_ORIGINS: https://social.skofie.my.id,http://127.0.0.1:3100,http://localhost:3100
+      SI_LANA_DATABASE_URL: postgresql://lana:lana_dev_password@lana-postgres:5432/lana
+      SI_LANA_POSTGRES_CONTAINER: lana-postgres
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8100:8000"
+    networks:
+      - default
+      - lana_net
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: https://social.skofie.my.id
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3000"
+    depends_on:
+      - api
+
+networks:
+  lana_net:
+    external: true
+    name: lana_lana_net
