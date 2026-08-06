@@ -1,4 +1,5 @@
 import { chromium } from "playwright-core";
+import { squareFeedBody, postTimestamp, trackBounds, deriveSearchStatus, searchCoverageBody } from "./feed.js";
 
 const CDP_URL = process.env.SI_CDP_URL ?? "http://127.0.0.1:9222";
 const API_URL = process.env.SI_API_URL ?? "http://127.0.0.1:8000";
@@ -26,11 +27,18 @@ function searchUrl(symbol) {
 
 async function scan(page, symbol) {
   const startedAt = new Date().toISOString();
+  const cutoff = Date.now() - CUTOFF_DAYS * 86_400_000;
   let responses = 0;
   let pagesScanned = 0;
   let matchedPosts = 0;
   let oldest = null;
+  let newest = null;
+  let unchanged = 0;
   const postIds = new Set();
+  // Buffer each matching search-list response so its posts are actually
+  // ingested, not merely counted. The passive collector misses these because
+  // search pages are only loaded during a targeted scan.
+  const feeds = [];
   const handler = async response => {
     let url;
     try { url = new URL(response.url()); } catch { return; }
@@ -42,11 +50,11 @@ async function scan(page, symbol) {
       const items = Array.isArray(payload?.data?.vos) ? payload.data.vos.filter(item => item?.id && item?.squareAuthorId) : [];
       responses += 1;
       pagesScanned = Math.max(pagesScanned, Number(requestBody?.pageIndex) || 1);
+      feeds.push(payload);
       for (const item of items) {
         postIds.add(String(item.id));
-        let timestamp = Number(item?.date);
-        if (timestamp && timestamp < 10_000_000_000) timestamp *= 1000;
-        if (Number.isFinite(timestamp)) oldest = oldest == null ? timestamp : Math.min(oldest, timestamp);
+        const timestamp = postTimestamp(item);
+        if (timestamp != null) [oldest, newest] = trackBounds(oldest, newest, timestamp);
       }
       matchedPosts = postIds.size;
     } catch {}
@@ -60,8 +68,6 @@ async function scan(page, symbol) {
     const body = (await page.locator("body").innerText()).toLowerCase();
     if (body.includes("captcha") || body.includes("security verification")) throw new Error("CHALLENGE");
     if (body.includes("log in") && !body.includes("search results")) throw new Error("LOGIN_REQUIRED");
-    const cutoff = Date.now() - CUTOFF_DAYS * 86_400_000;
-    let unchanged = 0;
     for (let index = 1; index < MAX_PAGES && (!oldest || oldest > cutoff); index += 1) {
       const before = postIds.size;
       await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
@@ -69,20 +75,36 @@ async function scan(page, symbol) {
       unchanged = postIds.size === before ? unchanged + 1 : 0;
       if (unchanged >= 2) break;
     }
-    if (!matchedPosts) status = "NO_RESULTS";
-    else if (oldest && oldest > cutoff && unchanged >= 2) status = "PARTIAL_HISTORY";
+    // Status is derived from what the search actually returned, so the desk can
+    // tell "scanned and found nothing" from "scanned but did not reach the
+    // cutoff" from "scanned and complete".
+    status = deriveSearchStatus({ responses, matchedPosts, oldest, cutoff, unchanged });
   } catch (error) {
     status = ["CHALLENGE", "LOGIN_REQUIRED"].includes(error.message) ? error.message : "ERROR";
     message = error.message;
   } finally {
     page.off("response", handler);
   }
-  await post("/api/search-coverage", {
-    symbol, query: symbol, status, pages_scanned: pagesScanned,
-    responses_observed: responses, matched_posts: matchedPosts,
-    started_at: startedAt, message,
-  });
-  console.log(JSON.stringify({ event: "square_search_complete", symbol, status, pages_scanned: pagesScanned, matched_posts: matchedPosts }));
+
+  // Ingest every matching search-list response via the server-side normalizer.
+  // A search that discovered posts but never stored them was a coverage row
+  // pointing at evidence the desk never held. The search path is tagged
+  // explicitly so provenance is preserved (teardown §16).
+  let ingested = 0;
+  for (const feed of feeds) {
+    try {
+      const result = await post("/api/square/feed", squareFeedBody(feed, "feed-search"));
+      ingested += result.normalized ?? 0;
+    } catch (error) {
+      console.error(JSON.stringify({ event: "square_feed_failed", symbol, category: error.message }));
+    }
+  }
+
+  await post("/api/search-coverage", searchCoverageBody({
+    symbol, status, pagesScanned, responses, matchedPosts, startedAt,
+    oldest, newest, cutoff, message,
+  }));
+  console.log(JSON.stringify({ event: "square_search_complete", symbol, status, pages_scanned: pagesScanned, matched_posts: matchedPosts, ingested }));
   return status;
 }
 

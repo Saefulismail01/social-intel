@@ -31,13 +31,14 @@ def load_universe(db: Session, path: Path) -> int:
 def ingest_posts(db: Session, records: list[dict], source: str = "fixture") -> int:
     posts = [SanitizedSquarePost(
         source_post_id=str(record["id"]),
-        observed_at=parse_time(record["observed_at"]),
+        published_at=parse_time(record["observed_at"]),
         author_id=str(record["author_id"]),
         author_name=str(record.get("author_name", "")),
         text=record["text"],
         public_url=record.get("public_url"),
         symbols=[record["symbol"]],
         engagement=PublicEngagement(likes=int(record.get("engagement", 0))),
+        detection_path="fixture",
     ) for record in records]
     result = ingest_sanitized(db, SanitizedIngestRequest(
         source=source,

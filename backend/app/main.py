@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +18,9 @@ from .health import update_heartbeat
 from .ingestion import ingest_sanitized
 from .intelligence import compute_snapshot
 from .lana_adapter import LanaUniverseAdapter
-from .models import CollectorHeartbeat, CrowdSnapshot, IngestionRun, PostMention, SearchCoverage, SocialPost, TrackedToken, XSliceCoverage, XVolumeBaseline
-from .schemas import SanitizedIngestRequest
+from .models import CollectorHeartbeat, CrowdSnapshot, IngestionRun, PostMention, SearchCoverage, SocialPost, SquareAuthor, SquareFeedCoverage, TrackedToken, XSliceCoverage, XVolumeBaseline
+from .schemas import RawSquareFeedRequest, SanitizedIngestRequest, SearchCoverageReport
+from .square_normalizer import normalize_feed_response
 
 
 def is_active(token: TrackedToken) -> bool:
@@ -490,25 +492,58 @@ def ingest(payload: SanitizedIngestRequest, db: Session = Depends(get_db)):
     result = ingest_sanitized(db, payload)
     for symbol in result["affected_symbols"]:
         compute_snapshot(db, symbol)
-    update_heartbeat(db, payload.source, "LIVE", batches=1, matched=len(payload.posts), unmatched=result["rejected"])
+    # Ingestion must not overwrite the collector's own heartbeat: the collector
+    # is the source of truth for whether it is live, and a single ingest call
+    # does not change its connection state or running batch counts. Heartbeats
+    # are written only by /api/collector/heartbeat.
     return result
 
 
+def tracked_symbol_set(db: Session) -> set[str]:
+    """Symbols the desk currently tracks, for server-side normalization."""
+    return set(db.scalars(select(TrackedToken.symbol)))
+
+
+@app.post("/api/square/feed")
+def ingest_square_feed(payload: RawSquareFeedRequest, db: Session = Depends(get_db)):
+    """Ingest a raw Binance Square feed/search response, normalized server-side.
+
+    The collector forwards the JSON it observed verbatim; this endpoint is the
+    only place that decides which symbols are tracked, so normalization cannot
+    drift between collector and server. The raw payload is never persisted —
+    only the sanitized posts derived from it are. `detection_path` is passed
+    through to the normalizer so each derived post carries its provenance.
+    """
+    tracked = tracked_symbol_set(db)
+    posts = normalize_feed_response(payload.feed, tracked, payload.detection_path)
+    result = ingest_sanitized(db, SanitizedIngestRequest(
+        source=payload.source,
+        collected_at=payload.collected_at,
+        posts=posts,
+    ))
+    for symbol in result["affected_symbols"]:
+        compute_snapshot(db, symbol)
+    return result | {"normalized": len(posts)}
+
+
 @app.post("/api/search-coverage")
-def record_search_coverage(payload: dict, db: Session = Depends(get_db)):
-    symbol = str(payload.get("symbol", "")).upper().replace("USDT", "")
+def record_search_coverage(payload: SearchCoverageReport, db: Session = Depends(get_db)):
+    symbol = payload.symbol
     if not db.get(TrackedToken, symbol):
         raise HTTPException(404, "Token is not tracked")
     coverage = SearchCoverage(
         source="binance-square-browser",
         symbol=symbol,
-        query=str(payload.get("query", symbol))[:128],
-        status=str(payload.get("status", "SUCCESS"))[:32],
-        pages_scanned=max(0, int(payload.get("pages_scanned", 0))),
-        responses_observed=max(0, int(payload.get("responses_observed", 0))),
-        matched_posts=max(0, int(payload.get("matched_posts", 0))),
-        started_at=datetime.fromisoformat(str(payload.get("started_at", datetime.now(timezone.utc).isoformat())).replace("Z", "+00:00")),
-        message=str(payload.get("message", ""))[:256] or None,
+        query=payload.query or symbol,
+        status=payload.status,
+        pages_scanned=payload.pages_scanned,
+        responses_observed=payload.responses_observed,
+        matched_posts=payload.matched_posts,
+        started_at=payload.started_at,
+        oldest_post_at=payload.oldest_post_at,
+        newest_post_at=payload.newest_post_at,
+        cutoff_at=payload.cutoff_at,
+        message=payload.message,
     )
     db.add(coverage)
     db.commit()
@@ -523,7 +558,85 @@ def search_coverage(symbol: str, db: Session = Depends(get_db)):
     return [{
         "status": row.status, "query": row.query, "pages_scanned": row.pages_scanned,
         "responses_observed": row.responses_observed, "matched_posts": row.matched_posts,
-        "started_at": row.started_at, "completed_at": row.completed_at, "message": row.message,
+        "started_at": row.started_at, "completed_at": row.completed_at,
+        "oldest_post_at": row.oldest_post_at, "newest_post_at": row.newest_post_at,
+        "cutoff_at": row.cutoff_at, "message": row.message,
+    } for row in rows]
+
+
+class SquareFeedCoverageReport(BaseModel):
+    """One observed Square /bapi feed batch, per detection path (teardown §16)."""
+
+    detection_path: str
+    batch_at: datetime
+    cards_observed: int = 0
+    matched_posts: int = 0
+    symbols_covered: list[str] = []
+
+
+@app.post("/api/square-feed-coverage")
+def record_square_feed_coverage(payload: list[SquareFeedCoverageReport], db: Session = Depends(get_db)):
+    """Record which Square feed batches were observed, per path.
+
+    Idempotent upsert keyed on (detection_path, batch_at): re-reporting the
+    same batch updates counts rather than duplicating rows. This keeps feed
+    coverage gaps visible rather than reading as zero.
+    """
+    written = 0
+    for item in payload:
+        path = item.detection_path[:32]
+        batch_at = as_utc(item.batch_at)
+        row = db.scalar(select(SquareFeedCoverage).where(
+            SquareFeedCoverage.detection_path == path,
+            SquareFeedCoverage.batch_at == batch_at,
+        ))
+        if row is None:
+            row = SquareFeedCoverage(detection_path=path, batch_at=batch_at)
+            db.add(row)
+        row.cards_observed = max(0, item.cards_observed)
+        row.matched_posts = max(0, item.matched_posts)
+        row.symbols_covered = ",".join(sorted(set(s.upper() for s in item.symbols_covered)))[:1024]
+        row.detected_at = datetime.now(timezone.utc)
+        written += 1
+    db.commit()
+    return {"recorded": written}
+
+
+@app.get("/api/square-feed-coverage")
+def get_square_feed_coverage(path: Optional[str] = None, limit: int = 50, db: Session = Depends(get_db)):
+    """Recent Square feed batches observed, optionally filtered by path."""
+    stmt = select(SquareFeedCoverage).order_by(SquareFeedCoverage.batch_at.desc()).limit(max(1, min(limit, 200)))
+    if path:
+        stmt = stmt.where(SquareFeedCoverage.detection_path == path[:32])
+    rows = list(db.scalars(stmt))
+    return [{
+        "detection_path": row.detection_path,
+        "batch_at": row.batch_at,
+        "cards_observed": row.cards_observed,
+        "matched_posts": row.matched_posts,
+        "symbols_covered": [s for s in row.symbols_covered.split(",") if s],
+        "detected_at": row.detected_at,
+    } for row in rows]
+
+
+@app.get("/api/square-authors")
+def square_authors(limit: int = 100, db: Session = Depends(get_db)):
+    """Square author registry populated passively from observed posts.
+
+    This is not a tracked-author control plane — it is a denormalized index
+    of authors we have actually seen through ingest (teardown §22.3). No
+    aggressive polling is performed; the registry only grows when a post is
+    ingested.
+    """
+    rows = list(db.scalars(select(SquareAuthor).order_by(SquareAuthor.last_seen_at.desc()).limit(max(1, min(limit, 500)))))
+    return [{
+        "author_id": row.author_id,
+        "author_name": row.author_name,
+        "verification_type": row.verification_type,
+        "post_count": row.post_count,
+        "first_seen_at": row.first_seen_at,
+        "last_seen_at": row.last_seen_at,
+        "last_post_id": row.last_post_id,
     } for row in rows]
 
 
@@ -536,7 +649,7 @@ class XSliceReport(BaseModel):
     posts_found: int = 0
     saturated: bool = False
     split_depth: int = 0
-    message: str | None = None
+    message: Optional[str] = None
 
 
 @app.post("/api/x-coverage")

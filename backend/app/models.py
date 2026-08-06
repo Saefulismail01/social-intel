@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -31,6 +31,14 @@ class TrackedToken(Base):
 
 
 class SocialPost(Base):
+    """A normalized social post (Square PGC card or X post).
+
+    Square-specific native PGC fields (teardown §15.3) and distinct
+    detection timestamps (§15.6) are stored here. X rows leave the Square-
+    specific columns at their defaults and use observed_at as the publish
+    time, as before.
+    """
+
     __tablename__ = "social_posts"
     __table_args__ = (UniqueConstraint("source", "source_post_id"),)
 
@@ -42,6 +50,7 @@ class SocialPost(Base):
     text: Mapped[str] = mapped_column(Text)
     normalized_text: Mapped[str] = mapped_column(Text)
     public_url: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+    share_url: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
     verification_type: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     card_type: Mapped[str] = mapped_column(String(64), default="")
     content_type: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -50,8 +59,29 @@ class SocialPost(Base):
     shares: Mapped[int] = mapped_column(Integer, default=0)
     views: Mapped[int] = mapped_column(Integer, default=0)
     account_age_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Distinct detection timestamps (teardown §15.6).
+    # observed_at is retained for back-compat = published time for Square,
+    # and remains the primary timeline axis for both Square and X.
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_detected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Native Square PGC enrichment (teardown §15.3–§15.5).
+    coin_pairs: Mapped[str] = mapped_column(String(512), default="")  # comma-joined
+    tendency: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    bullish_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bearish_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    hashtags: Mapped[str] = mapped_column(Text, default="")  # newline-joined
+    mentions: Mapped[str] = mapped_column(Text, default="")  # newline-joined
+    is_reply: Mapped[int] = mapped_column(Integer, default=0)
+    parent_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    is_sticky: Mapped[int] = mapped_column(Integer, default=0)
+    media_urls: Mapped[str] = mapped_column(Text, default="")  # newline-joined CDN links
+    # Provenance: the detection path that surfaced this observation
+    # (teardown §16). A post seen via multiple paths keeps the first path
+    # that created the row; later observations update last_observed_at.
+    detection_path: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
 
 
 class PostMention(Base):
@@ -107,7 +137,59 @@ class SearchCoverage(Base):
     matched_posts: Mapped[int] = mapped_column(Integer, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # When the oldest/newest discovered post was published, plus the cutoff the
+    # search was aiming to reach. NULL when the field does not apply (e.g. no
+    # posts were found, or no cutoff was requested).
+    oldest_post_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    newest_post_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    cutoff_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     message: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+
+
+class SquareFeedCoverage(Base):
+    """One observed Square feed batch per detection path (teardown §16).
+
+    The passive collector and the active search tool both observe /bapi
+    responses. This table records, per batch/path, how many cards were
+    seen and how many matched tracked symbols — so coverage gaps stay
+    visible rather than reading as zero. Idempotent upsert keyed on
+    (detection_path, batch_at).
+    """
+
+    __tablename__ = "square_feed_coverage"
+    __table_args__ = (UniqueConstraint("detection_path", "batch_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    detection_path: Mapped[str] = mapped_column(String(32), index=True)
+    batch_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    cards_observed: Mapped[int] = mapped_column(Integer, default=0)
+    matched_posts: Mapped[int] = mapped_column(Integer, default=0)
+    symbols_covered: Mapped[str] = mapped_column(String(1024), default="")  # comma-joined
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SquareAuthor(Base):
+    """Author registry populated from observed Square posts (teardown §22.3).
+
+    Hybrid axis: the desk stays symbol-centric, but observing which authors
+    produce posts is the first step toward an author-centric view. This table
+    is populated passively from ingest — no aggressive polling, no session
+    farms. It is a denormalized index of authors we have actually seen, not
+    a tracked-author control plane (that would require an explicit track
+    action, deliberately out of scope here).
+    """
+
+    __tablename__ = "square_authors"
+    __table_args__ = (UniqueConstraint("author_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    author_id: Mapped[str] = mapped_column(String(128), index=True)
+    author_name: Mapped[str] = mapped_column(String(256), default="")
+    verification_type: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    post_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_post_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 class XSliceCoverage(Base):

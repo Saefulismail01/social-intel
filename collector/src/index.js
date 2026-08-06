@@ -1,12 +1,8 @@
 import { chromium } from "playwright-core";
-import { sanitizeFeed } from "./normalize.js";
+import { squareFeedBody, detectionPathFor } from "./feed.js";
 
 const CDP_URL = process.env.SI_CDP_URL ?? "http://127.0.0.1:9222";
 const API_URL = process.env.SI_API_URL ?? "http://127.0.0.1:8000";
-const ENDPOINTS = new Set([
-  "/bapi/composite/v9/friendly/pgc/feed/feed-recommend/list",
-  "/bapi/composite/v2/friendly/pgc/feed/search/list",
-]);
 const attachedPages = new WeakSet();
 let batchesObserved = 0;
 let postsMatched = 0;
@@ -15,21 +11,45 @@ const MAX_QUEUE = 20;
 let queue = Promise.resolve();
 let queued = 0;
 
-async function trackedSymbols() {
-  const response = await fetch(`${API_URL}/api/universe`);
-  if (!response.ok) throw new Error(`universe_http_${response.status}`);
-  return (await response.json()).map(row => row.symbol);
+async function post(path, body) {
+  const response = await fetch(`${API_URL}${path}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${path}_http_${response.status}`);
+  return response.json();
 }
 
-async function forward(posts) {
-  if (!posts.length) return;
-  const response = await fetch(`${API_URL}/api/ingest`, {
+async function forwardRaw(payload, detectionPath) {
+  // Send the verbatim feed response to the desk; the server is the only place
+  // that knows which symbols are tracked, so normalizing here would let the
+  // collector's universe drift out of sync with ingestion. The detection path
+  // is passed through so each derived post carries its provenance.
+  const response = await fetch(`${API_URL}/api/square/feed`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ source: "binance-square-browser", collected_at: new Date().toISOString(), posts }),
+    body: JSON.stringify(squareFeedBody(payload, detectionPath)),
   });
-  if (!response.ok) throw new Error(`ingest_http_${response.status}`);
+  if (!response.ok) throw new Error(`square_feed_http_${response.status}`);
   const result = await response.json();
-  console.log(JSON.stringify({ event: "square_ingested", inserted: result.inserted, updated: result.updated, affected: result.affected_symbols }));
+  batchesObserved += 1;
+  // `normalized` is how many posts survived server-side tracking; everything
+  // else in the batch was an untracked symbol, not a failure.
+  const matched = result.normalized ?? 0;
+  const observed = Array.isArray(payload?.data?.vos) ? payload.data.vos.length : 0;
+  postsMatched += matched;
+  postsUnmatched += Math.max(0, observed - matched);
+  console.log(JSON.stringify({ event: "square_feed_forwarded", batch: batchesObserved, detection_path: detectionPath, normalized: matched, inserted: result.inserted, updated: result.updated, affected: result.affected_symbols }));
+  return { matched, observed };
+}
+
+async function reportFeedCoverage(detectionPath, batchAt, cardsObserved, matchedPosts, symbolsCovered) {
+  try {
+    await fetch(`${API_URL}/api/square-feed-coverage`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify([{ detection_path: detectionPath, batch_at: batchAt, cards_observed: cardsObserved, matched_posts: matchedPosts, symbols_covered: symbolsCovered }]),
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "feed_coverage_report_failed", category: error.message }));
+  }
 }
 
 function enqueue(task) {
@@ -44,19 +64,24 @@ function attach(page) {
   page.on("response", response => {
     let url;
     try { url = new URL(response.url()); } catch { return; }
-    if (response.status() !== 200 || !ENDPOINTS.has(url.pathname)) return;
+    if (response.status() !== 200) return;
+    const detectionPath = detectionPathFor(url.pathname);
+    if (!detectionPath) return;
     enqueue(async () => {
-      const [payload, symbols] = await Promise.all([response.json(), trackedSymbols()]);
-      const posts = sanitizeFeed(payload, symbols);
-      batchesObserved += 1;
-      postsMatched += posts.length;
-      postsUnmatched += Math.max(0, Array.isArray(payload?.data?.vos) ? payload.data.vos.length - posts.length : 0);
-      await fetch(`${API_URL}/api/collector/heartbeat`, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source: "binance-square-browser", status: "FEED_OBSERVED", batches: batchesObserved, matched: postsMatched, unmatched: postsUnmatched }),
+      const batchAt = new Date().toISOString();
+      const payload = await response.json();
+      const { matched, observed } = await forwardRaw(payload, detectionPath);
+      const rawSymbols = (payload?.data?.vos ?? []).flatMap(item => [
+        ...(item?.tradingPairsV2 ?? []).map(p => p?.symbol ?? "").filter(Boolean),
+        ...(item?.userInputTradingPairs ?? []).map(p => p?.symbol ?? "").filter(Boolean),
+      ]);
+      const symbolsCovered = [...new Set(rawSymbols.map(s => s.toUpperCase().replace(/USDT$/, "")))];
+      await reportFeedCoverage(detectionPath, batchAt, observed, matched, symbolsCovered);
+      await post("/api/collector/heartbeat", {
+        source: "binance-square-browser", status: "FEED_OBSERVED",
+        batches: batchesObserved, matched: postsMatched, unmatched: postsUnmatched,
       });
-      console.log(JSON.stringify({ event: "feed_batch_observed", batch: batchesObserved, matched: posts.length, matched_total: postsMatched, unmatched_total: postsUnmatched }));
-      await forward(posts);
+      console.log(JSON.stringify({ event: "feed_batch_observed", batch: batchesObserved, detection_path: detectionPath, matched, matched_total: postsMatched, unmatched_total: postsUnmatched }));
     });
   });
 }
