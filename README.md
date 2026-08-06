@@ -1,5 +1,7 @@
 # Social Intelligence Desk
 
+> Repository synchronized with the production version.
+
 Crowd-intelligence companion for Lana-Migration. Lana chooses the market universe; this desk measures attention, breadth, authenticity, coordination, and crowd lifecycle.
 
 ## Current MVP
