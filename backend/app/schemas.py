@@ -6,11 +6,20 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-FORBIDDEN_KEY_PARTS = {
-    "authorization", "cookie", "csrf", "token", "secret", "password",
-    "fingerprint", "device-info", "device_info", "fvideo", "session",
-    "aws-waf", "credential", "x-trace", "bnc-uuid",
+# Exact key names (and a few request-header spellings) that must never enter
+# the desk. Substring matching is intentionally avoided: live Square cards
+# ship public fields like `tokenLatestInfo` / `web3TokenInfo` / `marketTokenId`
+# which are not secrets but contain the word "token".
+FORBIDDEN_KEYS = {
+    "authorization", "cookie", "cookies", "csrf", "csrftoken", "x-csrf-token",
+    "x-csrf", "password", "secret", "secrets", "session", "sessionid",
+    "set-cookie", "fingerprint", "device-info", "device_info", "fvideo",
+    "aws-waf", "aws-waf-token", "credential", "credentials", "x-trace",
+    "bnc-uuid", "auth_token", "access_token", "refresh_token", "id_token",
+    "ct0", "guest_id",
 }
+# Accept both hyphen and underscore spellings of the same forbidden name.
+_FORBIDDEN_NORMALIZED = {k.lower().replace("-", "_") for k in FORBIDDEN_KEYS}
 MAX_POSTS_PER_BATCH = 100
 MAX_TEXT_LENGTH = 20_000
 
@@ -18,8 +27,9 @@ MAX_TEXT_LENGTH = 20_000
 def reject_sensitive_keys(value: Any, path: str = "payload") -> None:
     if isinstance(value, dict):
         for key, nested in value.items():
-            lowered = str(key).lower()
-            if any(part in lowered for part in FORBIDDEN_KEY_PARTS):
+            # Exact key match only — live Square cards contain public fields
+            # like tokenLatestInfo that must not be treated as secrets.
+            if str(key).lower().replace("-", "_") in _FORBIDDEN_NORMALIZED:
                 raise ValueError(f"Sensitive field rejected at {path}.{key}")
             reject_sensitive_keys(nested, f"{path}.{key}")
     elif isinstance(value, list):

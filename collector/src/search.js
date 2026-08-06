@@ -6,6 +6,8 @@ const API_URL = process.env.SI_API_URL ?? "http://127.0.0.1:8000";
 const MAX_PAGES = Number(process.env.SI_SQUARE_SEARCH_PAGES ?? 5);
 const CUTOFF_DAYS = Number(process.env.SI_SQUARE_SEARCH_DAYS ?? 7);
 const WAIT_MS = Number(process.env.SI_SQUARE_SEARCH_WAIT_MS ?? 5000);
+// Pause between symbols so search traffic does not trip WAF; keep short on VPS.
+const SYMBOL_GAP_MS = Number(process.env.SI_SQUARE_SYMBOL_GAP_MS ?? 30_000);
 
 async function post(path, body) {
   const response = await fetch(`${API_URL}${path}`, {
@@ -121,7 +123,7 @@ async function main() {
   for (const symbol of symbols) {
     const status = await scan(page, symbol);
     if (["CHALLENGE", "LOGIN_REQUIRED"].includes(status)) break;
-    await page.waitForTimeout(30_000);
+    await page.waitForTimeout(SYMBOL_GAP_MS);
   }
   await browser.close();
 }
