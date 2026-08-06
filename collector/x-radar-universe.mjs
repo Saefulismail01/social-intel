@@ -9,7 +9,13 @@
  *
  * Env:
  *   SI_CDP_URL, SI_API_URL, SI_RADAR_SYMBOLS, SI_RADAR_KEEP, SI_RADAR_LIMIT
- *   SI_RADAR_ONLY_MISSING=1  skip symbols that already have x-radar baseline
+ *   SI_RADAR_ONLY_MISSING=1  skip symbols that already have *today's* official
+ *                            x-radar day (UTC). Historical baselines alone do
+ *                            not count — without a re-pull at the day boundary
+ *                            the desk shows TODAY=0 for every row.
+ *   SI_RADAR_STALE_HOURS=N   with ONLY_MISSING, also re-pull when today's
+ *                            baseline was last fetched more than N hours ago
+ *                            (keeps the still-filling current day fresh).
  */
 import { chromium } from "playwright-core";
 
@@ -23,6 +29,9 @@ const KEEP = new Set(
 );
 const LIMIT = process.env.SI_RADAR_LIMIT ? Number(process.env.SI_RADAR_LIMIT) : Infinity;
 const ONLY_MISSING = process.env.SI_RADAR_ONLY_MISSING === "1";
+const STALE_HOURS = process.env.SI_RADAR_STALE_HOURS
+  ? Number(process.env.SI_RADAR_STALE_HOURS)
+  : 0;
 
 // queryIds from ondemand.Insights bundle (Aug 2026)
 const Q = {
@@ -52,6 +61,25 @@ function windowTimes() {
   return { from_time, to_time, granularity: "Day", timezone_offset: 0 };
 }
 
+function utcToday() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * A row still needs an official pull when the current UTC day has no x-radar
+ * count. Having source=x-radar from older days is not enough — that is exactly
+ * the failure mode that zeroed every TODAY cell after midnight.
+ */
+function needsOfficialBaseline(row, today = utcToday()) {
+  const history = row?.x_signal?.history;
+  if (!Array.isArray(history) || !history.length) return true;
+  const day = history.find((h) => h.date === today);
+  if (!day) return true;
+  // expected_posts is set only from x_volume_baseline; 0 is a valid quiet day.
+  if (day.posts_source === "x-radar" && day.expected_posts != null) return false;
+  return day.expected_posts == null;
+}
+
 async function trackedSymbols() {
   if (process.env.SI_RADAR_SYMBOLS) {
     return process.env.SI_RADAR_SYMBOLS.split(",")
@@ -64,15 +92,48 @@ async function trackedSymbols() {
   return rows.map((row) => String(row.symbol).toUpperCase());
 }
 
+async function staleTodaySymbols(symbols) {
+  if (!STALE_HOURS || !Number.isFinite(STALE_HOURS) || STALE_HOURS <= 0) {
+    return new Set();
+  }
+  const today = utcToday();
+  const cutoff = Date.now() - STALE_HOURS * 3600 * 1000;
+  const stale = new Set();
+  // Sequential on purpose: keep load on the API light; N is the kanban size (~30).
+  for (const symbol of symbols) {
+    try {
+      const response = await fetch(`${API_URL}/api/x-baseline/${symbol}?days=2`);
+      if (!response.ok) {
+        stale.add(symbol);
+        continue;
+      }
+      const data = await response.json();
+      const todayRow = (data.days || []).find((d) => d.date === today);
+      if (!todayRow?.fetched_at) {
+        stale.add(symbol);
+        continue;
+      }
+      if (new Date(todayRow.fetched_at).getTime() < cutoff) stale.add(symbol);
+    } catch {
+      stale.add(symbol);
+    }
+  }
+  return stale;
+}
+
 async function missingSymbols(all) {
   if (!ONLY_MISSING) return all;
   const response = await fetch(`${API_URL}/api/radar`);
   if (!response.ok) return all;
   const rows = await response.json();
-  const have = new Set(
-    rows.filter((r) => r.x_signal?.source === "x-radar").map((r) => r.symbol),
+  const today = utcToday();
+  const need = new Set(
+    rows.filter((r) => needsOfficialBaseline(r, today)).map((r) => String(r.symbol).toUpperCase()),
   );
-  return all.filter((s) => !have.has(s));
+  // Mid-day re-pull: current day is still filling in X Radar's series.
+  const stale = await staleTodaySymbols(all);
+  for (const s of stale) need.add(s);
+  return all.filter((s) => need.has(s));
 }
 
 async function postBaseline(reports) {

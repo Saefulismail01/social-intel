@@ -60,9 +60,12 @@ curl -X POST http://localhost:8000/api/universe/sync
 
 **Automation (VPS):**
 - every **15 min** — `social-universe-sync.timer` runs
-  `scripts/vps-universe-and-radar.sh` (sync kanban + X Radar for any *new*
-  active coins still missing official counts)
-- every **1 h** — `social-x-radar.timer` safety net (`SI_RADAR_ONLY_MISSING=1`)
+  `scripts/vps-universe-and-radar.sh` (sync kanban + X Radar for active coins
+  still missing *today's* UTC official day — historical baselines alone do not count)
+- every **1 h** — `social-x-radar.timer` safety net
+  (`SI_RADAR_ONLY_MISSING=1`, `SI_RADAR_STALE_HOURS=4`): re-pulls tokens with no
+  official count for today, or whose today's count is older than 4 hours
+  (the current day is still filling in X Radar)
 
 Production uses TCP to Lana Postgres (`SI_LANA_DATABASE_URL` on `lana_lana_net`).
 Fixture mode remains the safe local default when that URL is unset.
